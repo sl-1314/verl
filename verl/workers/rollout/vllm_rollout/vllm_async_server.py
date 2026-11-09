@@ -66,6 +66,19 @@ from verl.workers.rollout.vllm_rollout.utils import (
 
 _VLLM_VERSION = version.parse(vllm.__version__)
 
+# Bool engine args that safely accept a --no-<name> negation flag on the
+# vLLM CLI (registered as BooleanOptionalAction). Used to pass False-valued
+# bools through build_cli_args_from_config, which drops them outright.
+_NO_FLAG_BOOL_KEYS = frozenset(
+    {
+        "enable_prefix_caching",
+        "enable_chunked_prefill",
+        "enable_sleep_mode",
+        "enforce_eager",
+        "skip_tokenizer_init",
+    }
+)
+
 if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
     get_encoding()
 
@@ -343,10 +356,21 @@ class vLLMHttpServer:
                 f"num workers ({len(self.workers)}) should be equal to "
                 f"dp_size_local ({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
             )
+            # node_rank 0 runs the full server (run_server); every other node
+            # runs run_headless. vLLM treats a non-None data_parallel_start_rank
+            # on a non-headless launch as "hybrid dp lb mode", whose engine
+            # handshake then REJECTS headless remote engines ("Remote engine N
+            # must not use --headless in external or hybrid dp lb mode").
+            # Node 0's start rank is 0 by default, so only nodes with
+            # node_rank > 0 may pass the offset.
             dp_args = {
                 "data_parallel_size": self.config.data_parallel_size,
                 "data_parallel_size_local": data_parallel_size_local,
-                "data_parallel_start_rank": self.node_rank * data_parallel_size_local,
+                **(
+                    {"data_parallel_start_rank": self.node_rank * data_parallel_size_local}
+                    if self.node_rank > 0
+                    else {}
+                ),
                 "data_parallel_address": self._master_address,
                 "data_parallel_rpc_port": self._dp_rpc_port,
             }
@@ -407,6 +431,14 @@ class vLLMHttpServer:
             args["kv_transfer_config"] = json.dumps(self._disaggregation_kv_transfer_config)
 
         server_args = ["serve", self.model_config.local_path] + build_cli_args_from_config(args)
+        # build_cli_args_from_config drops False-valued bools, so the engine
+        # would silently fall back to its default (e.g. enable_prefix_caching
+        # defaulting back to True). Re-emit them as explicit --no- flags.
+        # Only keys verified to register as BooleanOptionalAction are safe
+        # here; optional-flag style bools (e.g. do_sample) reject --no-.
+        for _k, _v in args.items():
+            if isinstance(_v, bool) and not _v and _k in _NO_FLAG_BOOL_KEYS:
+                server_args.append(f"--no-{_k}")
 
         if self.replica_rank == 0:
             pprint(server_args)

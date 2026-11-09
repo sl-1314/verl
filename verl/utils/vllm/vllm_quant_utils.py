@@ -278,6 +278,12 @@ def clear_rocm_attention_weight_caches(model):
             del module._dsv4_wo_a_bf16
 
 
+# verl_mlite (megatron-lite) calls the newer name ``refresh_...`` after a
+# layerwise refit. Dropping the cache is sufficient because the rebuild is
+# lazy, so alias the old name; the ROCm guard inside makes it a no-op on CUDA.
+refresh_rocm_attention_weight_caches = clear_rocm_attention_weight_caches
+
+
 def quant_weights(weights, model, quant_config, dtype=torch.bfloat16):
     """Quantize weights to FP8 format using a memory-efficient generator.
 
@@ -362,6 +368,45 @@ def process_quanted_weights_after_loading(model, reload_state):
     process_mxfp4_moe_weights_after_loading(reload_state.get("mxfp4_moe_modules") or [])
 
 
+_E3_CALL_SEQ = 0
+
+
+def _maybe_dump_e3(weights, model):
+    """Bisect aid for the online 0-diff investigation (env-gated, default off).
+
+    Persists the actor-side weight stream and the engine's live parameters for
+    layer-0 tensors in one file per load call, so the sync's fidelity (values
+    AND scale layouts) can be checked offline against the checkpoint.
+    """
+    import os
+
+    root = os.environ.get("VERL_E3_DUMP")
+    if not root:
+        return
+    global _E3_CALL_SEQ
+    _E3_CALL_SEQ += 1
+    try:
+
+        def keep(name):
+            return "layers.0" in name and (".attn." in name or "experts.0." in name or "shared" in name or "scale" in name)
+
+        streamed = {n: t.detach().cpu().clone() for n, t in weights if keep(n)}
+        layout = {n: (tuple(t.shape), str(t.dtype)) for n, t in weights}
+        live, live_layout = {}, {}
+        for name, p in model.named_parameters():
+            live_layout[name] = (tuple(p.shape), str(p.dtype))
+            if keep(name):
+                live[name] = p.detach().cpu().clone()
+        os.makedirs(root, exist_ok=True)
+        path = f"{root}/load_pid{os.getpid()}_seq{_E3_CALL_SEQ}.pt"
+        torch.save(
+            {"streamed": streamed, "live": live, "streamed_layout": layout, "live_layout": live_layout}, path
+        )
+        logger.info("E3 dump written: %s (%d streamed, %d live tensors)", path, len(streamed), len(live))
+    except Exception as e:  # noqa: BLE001 - diagnostics must never break the refit
+        logger.warning("E3 dump failed: %s", e)
+
+
 def load_quanted_weights(weights, model_runner, is_drafter=False):
     if is_drafter:
         drafter = getattr(model_runner, "drafter", None)
@@ -405,6 +450,7 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
                 param.__class__ = param.orig_type
                 del param.orig_type
 
+    _maybe_dump_e3(weights, model)
     return loaded_params
 
 

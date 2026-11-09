@@ -428,7 +428,17 @@ def build_fp8_method_patchers(vllm_version):
     # vLLM 0.20 refactored FP8 post-load handling and removed
     # maybe_post_process_fp8_weight_block. Keep its native transformation logic,
     # but preserve parameter subclass metadata for RL weight reloads.
-    if vllm_version >= version.parse("0.20.0"):
+    # Some forks carry a legacy 0.1.dev version string while already being on
+    # the 0.20 lineage (symbol removed), so feature-detect the symbol instead
+    # of trusting the version string alone.
+    try:
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (  # noqa: F401
+            maybe_post_process_fp8_weight_block,
+        )
+    except ImportError:
+        maybe_post_process_fp8_weight_block = None
+
+    if vllm_version >= version.parse("0.20.0") or maybe_post_process_fp8_weight_block is None:
         from vllm.model_executor.layers.quantization.fp8 import (
             Fp8LinearMethod,
             Fp8MoEMethod,

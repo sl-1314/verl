@@ -60,6 +60,49 @@ def calculate_log_prob_diff(log_probs1: torch.Tensor, log_probs2: torch.Tensor, 
     return torch.masked_select(full_diff, mask)
 
 
+_E5_DUMP_SEQ = 0
+
+
+def _maybe_dump_e5(data: DataProto) -> None:
+    """Bisect aid for the online 0-diff investigation (env-gated, default off).
+
+    Persists the full per-token logprob tensors from both sides of the online
+    kl (engine ``rollout_log_probs`` vs actor-recomputed ``old_log_probs``)
+    plus the token ids and masks, so the *structure* of the divergence (which
+    positions / sequences / tokens diverge) can be analyzed offline.
+    """
+    import os
+
+    root = os.environ.get("VERL_E5_DUMP")
+    if not root:
+        return
+    global _E5_DUMP_SEQ
+    _E5_DUMP_SEQ += 1
+    try:
+        payload = {
+            k: (v.detach().cpu().clone() if torch.is_tensor(v) else v)
+            for k, v in data.batch.items()
+            if torch.is_tensor(v) and k
+            in (
+                "rollout_log_probs",
+                "old_log_probs",
+                "response_mask",
+                "attention_mask",
+                "loss_mask",
+                "responses",
+                "input_ids",
+                "prompts",
+                "response_ids",
+            )
+        }
+        os.makedirs(root, exist_ok=True)
+        path = f"{root}/e5_step{_E5_DUMP_SEQ}_pid{os.getpid()}.pt"
+        torch.save(payload, path)
+        logger.info("E5 dump written: %s (%d tensors)", path, len(payload))
+    except Exception as e:  # noqa: BLE001 - diagnostics must never break training
+        logger.warning("E5 dump failed: %s", e)
+
+
 def calculate_debug_metrics(data: DataProto) -> dict:
     """
     calculate rollout vs actor logprobs diff, for debugging purpose
@@ -80,6 +123,7 @@ def calculate_debug_metrics(data: DataProto) -> dict:
             "training/rollout_actor_probs_pearson_corr": logprob's pearson corrcoef of rollout vs. actor, reference to https://arxiv.org/pdf/2506.13585
     """
 
+    _maybe_dump_e5(data)
     rollout_old_log_probs = data.batch["rollout_log_probs"]
     actor_old_log_probs = data.batch["old_log_probs"]
     if "response_mask" in data.batch:
@@ -112,6 +156,36 @@ def calculate_debug_metrics(data: DataProto) -> dict:
 
     pearson_corrcoef = pearson_correlation_coefficient(actor_probs, rollout_probs, response_mask_bool)
     rollout_probs_diff = calculate_log_prob_diff(actor_probs, rollout_probs, response_mask_bool)
+
+    # ---- live rollout-vs-actor verdict (debug): print immediately, don't
+    # wait for the step to end. Per-sequence bitwise + first-divergence info.
+    try:
+        lp_diff = (rollout_old_log_probs - actor_old_log_probs).abs()
+        _m = response_mask_bool
+        _lines = [
+            "[rollout_corr live] overall: "
+            f"valid={int(_m.sum())} "
+            f"|lp diff| max/mean={lp_diff[_m].max().item():.4e}/{lp_diff[_m].mean().item():.4e} "
+            f"bitwise={int((lp_diff[_m] == 0).sum())}/{int(_m.sum())} "
+            f"corr={pearson_corrcoef:.6f}"
+        ]
+        for _i in range(lp_diff.shape[0]):
+            _mi = _m[_i]
+            if not bool(_mi.any()):
+                continue
+            _d = lp_diff[_i][_mi]
+            _nz = (_d > 0).nonzero()
+            _first = int(_nz[0].item()) if len(_nz) else -1
+            _bw = int((_d == 0).sum())
+            _lines.append(
+                f"[rollout_corr live]   seq{_i}: valid={int(_mi.sum())} "
+                f"bitwise={_bw}/{int(_mi.sum())} max={_d.max().item():.4e} "
+                f"first_nonzero_resp_pos={_first}"
+            )
+        print("\n".join(_lines), flush=True)
+    except Exception as _e:  # noqa: BLE001 - debug print must never break training
+        logger.warning(f"live rollout_corr print failed: {_e}")
+
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),

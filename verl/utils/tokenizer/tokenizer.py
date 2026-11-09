@@ -13,6 +13,8 @@
 # limitations under the License.
 """Utils for tokenization."""
 
+import json
+import os
 import types
 import warnings
 
@@ -176,7 +178,67 @@ def hf_tokenizer(name_or_path, correct_pad_token=True, correct_gemma2=True, **kw
     tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
     if correct_pad_token:
         set_pad_token_id(tokenizer)
-    return tokenizer
+    return _maybe_wrap_deepseek_v4_tokenizer(tokenizer, name_or_path)
+
+
+def _is_deepseek_v4_tokenizer_dir(name_or_path) -> bool:
+    """Whether ``name_or_path`` is a DeepSeek-V4 model directory.
+
+    Detected from ``config.json`` rather than AutoConfig: the model type is
+    only registered on the serving side, so transformers may not resolve it.
+    """
+    if not isinstance(name_or_path, (str, os.PathLike)):
+        return False
+    try:
+        with open(os.path.join(os.fspath(name_or_path), "config.json")) as f:
+            return json.load(f).get("model_type") in ("deepseek_v4", "deepseek_v41")
+    except (OSError, ValueError):
+        return False
+
+
+def _maybe_wrap_deepseek_v4_tokenizer(tokenizer, name_or_path):
+    """Apply the vLLM fork's official DeepSeek-V4 chat encoding to this tokenizer.
+
+    DeepSeek-V4 repos ship no jinja chat template; the official prompt encoding
+    is the reference Python implementation in ``encoding/`` of the model repo,
+    which the vLLM fork wires into serving via its tokenizer registry
+    (``tokenizer_mode="deepseek_v4"`` wraps ``apply_chat_template`` to call it).
+    verl builds tokenizers straight from transformers, so rollout would die in
+    ``apply_chat_template`` with no template to load. Wrapping here makes the
+    RL path render prompts through the same official encoder as serving and
+    consumes the same kwargs (``enable_thinking``, ``drop_thinking``,
+    ``reasoning_effort``), so rollouts are byte-identical to inference.
+
+    Stock vLLM has no wrapper to import; keep HF behavior there.
+    """
+    if not _is_deepseek_v4_tokenizer_dir(name_or_path):
+        return tokenizer
+    # A template shipped with the model dir (chat_template.jinja) wins: it is
+    # an explicit rendering choice, e.g. the DSML tool template used by
+    # RLFactory, and covers shapes the reference encoder bridge does not.
+    if getattr(tokenizer, "chat_template", None):
+        return tokenizer
+    try:
+        from vllm.tokenizers.deepseek_v4 import get_deepseek_v4_tokenizer
+    except ImportError:
+        return tokenizer
+    wrapped = get_deepseek_v4_tokenizer(tokenizer)
+    # A template may also be assigned after construction: verl's
+    # ``custom_chat_template`` config lands as ``tokenizer.chat_template`` on
+    # the already-built tokenizer (workers/config/model.py, agent_loop.py).
+    # The fork's override ignores that attribute, so dispatch back to the HF
+    # implementation whenever one is set, and only fall through to the native
+    # encoder otherwise.
+    hf_apply_chat_template = tokenizer.__class__.apply_chat_template
+    native_apply_chat_template = wrapped.apply_chat_template
+
+    def _template_aware_apply_chat_template(self, *args, **kwargs):
+        if getattr(self, "chat_template", None):
+            return hf_apply_chat_template(self, *args, **kwargs)
+        return native_apply_chat_template(*args, **kwargs)
+
+    wrapped.apply_chat_template = types.MethodType(_template_aware_apply_chat_template, wrapped)
+    return wrapped
 
 
 def hf_processor(name_or_path, **kwargs):
