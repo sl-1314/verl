@@ -22,6 +22,7 @@ from verl.trainer.config import CheckpointConfig, RolloutCorrectionConfig
 from verl.utils.profiler.config import ProfilerConfig
 
 from .engine import (
+    AutomodelEngineConfig,
     FSDPEngineConfig,
     McoreEngineConfig,
     TorchtitanEngineConfig,
@@ -38,6 +39,7 @@ __all__ = [
     "McoreActorConfig",
     "VeOmniActorConfig",
     "TorchTitanActorConfig",
+    "AutomodelActorConfig",
 ]
 
 
@@ -391,3 +393,27 @@ class TorchTitanActorConfig(ActorConfig):
         """Validate TorchTitan actor configuration parameters."""
         super().__post_init__()
         self.engine = self.torchtitan
+
+
+@dataclass
+class AutomodelActorConfig(ActorConfig):
+    """Configuration for Automodel actor models (nemo_automodel backend).
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        strategy (str): Training strategy set to 'automodel' for the NeMo Automodel engine.
+        automodel (AutomodelEngineConfig): Configuration for Automodel engine settings.
+        use_remove_padding (bool): Whether to remove padding tokens in inputs during training
+        use_rollout_log_probs (bool): Whether to use log probabilities from rollout engine
+    """
+
+    strategy: str = "automodel"
+    automodel: AutomodelEngineConfig = field(default_factory=AutomodelEngineConfig)
+    use_remove_padding: bool = False
+    use_rollout_log_probs: bool = False
+
+    def __post_init__(self):
+        """Validate Automodel actor configuration parameters."""
+        super().__post_init__()
+        self.engine = self.automodel

@@ -1,0 +1,20 @@
+# automodel critic config, inheriting from trainer/config/critic/critic.yaml
+# NOTE: GRPO/DAPO (adv_estimator != gae) never instantiates the critic; this file
+# exists so that `model_engine=automodel` composes (the ppo_trainer defaults
+# always mount `${model_engine}_critic`). PPO/GAE on the automodel engine is
+# NOT supported: there is no AutomodelEngineWithValueHead implementation.
+defaults:
+  - critic
+
+  # automodel optimizer config
+  - ../optim@optim: automodel
+
+  # automodel engine config
+  - ../engine@engine: automodel
+
+  # load the reference default config, then apply the fields in the current yaml
+  - _self_
+
+_target_: verl.workers.config.CriticConfig
+
+strategy: automodel
