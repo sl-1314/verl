@@ -201,6 +201,9 @@ class vLLMHttpServer:
             self._master_port = None
             self._dp_rpc_port = None
             self._dp_master_port = None
+            self._master_sock = None
+            self._dp_rpc_sock = None
+            self._dp_master_sock = None
 
         self._post_init(cuda_visible_devices)
 
@@ -258,6 +261,23 @@ class vLLMHttpServer:
             self._master_address = master_address
             self._master_port = master_port
             self._dp_rpc_port = dp_rpc_port
+
+        # Release the port-reservation sockets now that every consumer has the
+        # port numbers: vllm's rank0 binds master_port / dp_master_port for its
+        # TCPStore / DP control plane during engine startup, and a held
+        # (bound-but-not-listening) socket makes that bind fail with
+        # EADDRINUSE (train_36: DistNetworkError port 44843). get_free_port's
+        # contract (net_utils docstring) is that the caller closes the socket
+        # before the target service binds the port.
+        for sock in (self._master_sock, self._dp_rpc_sock, self._dp_master_sock):
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+        self._master_sock = None
+        self._dp_rpc_sock = None
+        self._dp_master_sock = None
 
         # 1. setup vllm serve cli args
         engine_kwargs = self.config.get("engine_kwargs", {}).get(self._get_engine_kwargs_key(), {}) or {}
