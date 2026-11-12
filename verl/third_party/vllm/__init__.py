@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 from importlib.metadata import PackageNotFoundError, version
 
 from packaging import version as vs
@@ -31,6 +32,17 @@ package_name = "vllm"
 package_version = get_version(package_name)
 vllm_version = None
 VLLM_SLEEP_LEVEL = 1
+
+# Source/dev builds report e.g. "0.1.dev1+g<sha>.cu129" while carrying the
+# modern API surface (sleep levels, V1 engine). VERL_VLLM_FORCE_VERSION lets
+# a pinned dev build pass the compatibility gate explicitly.
+_force_version = os.environ.get("VERL_VLLM_FORCE_VERSION")
+if _force_version:
+    if package_version is None:
+        raise ValueError(
+            "VERL_VLLM_FORCE_VERSION is set but vllm is not installed at all"
+        )
+    package_version = _force_version
 
 if package_version is None:
     if not is_sglang_available():

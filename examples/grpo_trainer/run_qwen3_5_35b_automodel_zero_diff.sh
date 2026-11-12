@@ -18,7 +18,14 @@ NDEVICES_PER_NODE=${NDEVICES_PER_NODE:-1}
 NNODES=${NNODES:-1}
 
 GEN_TP=${GEN_TP:-1}
-ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.75}
+# 0.5 keeps vllm's claim (weights 65.4 GiB + small KV/activation budget) small
+# enough that it always fits alongside the actor engine's ~64 GiB transient
+# init footprint — the two engine startups race, so this must hold in the
+# worst case, not just when the actor finishes offloading first. GDN layers
+# carry no KV cache, so a tiny KV budget still covers the 8-prompt x n=4
+# rollout. Rollout-side knobs never touch the 0-diff acceptance surface
+# (actor logits vs vllm re-scoring).
+ROLLOUT_GPU_MEM_UTIL=${ROLLOUT_GPU_MEM_UTIL:-0.5}
 
 RAY_DATA_HOME=${RAY_DATA_HOME:-"/tmp/workspace/qwen35-vllm-automodel"}
 MODEL_PATH=${MODEL_PATH:-"${RAY_DATA_HOME}/cache/Qwen3.5-35B-A3B"}
@@ -85,8 +92,16 @@ ROLLOUT=(
     actor_rollout_ref.rollout.data_parallel_size=1
     actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL}
     actor_rollout_ref.rollout.n=4
+    # prompts+responses are capped at 512+512; the model default
+    # (max_model_len=262144) would demand >5 GiB KV for a single max-len
+    # request, which the tiny colocate KV budget cannot cover.
+    actor_rollout_ref.rollout.max_model_len=1536
+    # 8 prompts x n=4 = 32 concurrent decode seqs; every decode seq needs a
+    # GDN (Mamba-style) state cache block, and the tiny colocate KV budget
+    # only holds ~123 of them (vllm errors at the default max_num_seqs=256).
+    actor_rollout_ref.rollout.max_num_seqs=64
     actor_rollout_ref.rollout.enable_chunked_prefill=True
-    actor_rollout_ref.rollout.max_num_batched_tokens=8192
+    actor_rollout_ref.rollout.max_num_batched_tokens=2048
     actor_rollout_ref.rollout.free_cache_engine=True
     actor_rollout_ref.rollout.enforce_eager=False
     actor_rollout_ref.rollout.enable_prefix_caching=False

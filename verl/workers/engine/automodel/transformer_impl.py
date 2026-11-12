@@ -185,14 +185,20 @@ class AutomodelEngine(BaseEngine):
         torch.cuda.empty_cache()
 
     def _build_optimizer(self, module):
-        """Build optimizer via Automodel's build_optimizer."""
-        from nemo_automodel.components.config.loader import ConfigNode
-        from nemo_automodel.recipes.llm.train_ft import build_optimizer as automodel_build_optimizer
+        """Build optimizer via Automodel's build_optimizer.
+
+        Uses the (name_or_path, kwargs) tuple form: a dotted import path
+        (e.g. "torch.optim.AdamW") resolves through build_optimizer_config's
+        factory escape hatch, so plain torch optimizers work; the typed
+        OptimizerConfig subclasses (registry names like "adamw") are also
+        accepted. Params without requires_grad (e.g. zero-diff frozen experts)
+        are excluded by the config's build().
+        """
+        from nemo_automodel.components.optim.optimizer import build_optimizer as automodel_build_optimizer
 
         config = self.optimizer_config
 
-        opt_dict = {
-            "_target_": f"{config.optimizer_impl}.{config.optimizer}",
+        opt_kwargs = {
             "lr": config.lr,
             "weight_decay": config.weight_decay,
             "eps": config.eps,
@@ -200,21 +206,25 @@ class AutomodelEngine(BaseEngine):
         }
 
         if config.master_weights:
-            opt_dict["master_weights"] = config.master_weights
+            opt_kwargs["master_weights"] = config.master_weights
         if config.store_param_remainders:
-            opt_dict["store_param_remainders"] = config.store_param_remainders
+            opt_kwargs["store_param_remainders"] = config.store_param_remainders
 
         _short_to_torch = {"bf16": "torch.bfloat16", "fp32": "torch.float32", "fp16": "torch.float16"}
         for attr in ("exp_avg_dtype", "exp_avg_sq_dtype", "master_weight_dtype"):
             val = getattr(config, attr, None)
             if val is not None:
-                opt_dict[attr] = _short_to_torch.get(val, val)
+                opt_kwargs[attr] = _short_to_torch.get(val, val)
 
         if config.override_optimizer_config:
-            opt_dict.update(config.override_optimizer_config)
+            opt_kwargs.update(config.override_optimizer_config)
 
-        cfg_opt = ConfigNode(opt_dict)
-        optimizers = automodel_build_optimizer(module, cfg_opt, self.distributed_config, self.device_mesh)
+        name = (
+            config.optimizer
+            if "." in str(config.optimizer)
+            else f"{config.optimizer_impl}.{config.optimizer}"
+        )
+        optimizers = automodel_build_optimizer(module, (name, opt_kwargs))
         assert len(optimizers) == 1, f"Expected 1 optimizer, got {len(optimizers)}"
         return optimizers[0]
 
@@ -451,17 +461,39 @@ class AutomodelEngine(BaseEngine):
             offload_automodel_optimizer(self.optimizer)
 
     def get_per_tensor_param(self, **kwargs):
-        load_automodel_model_to_gpu(self.module)
-
+        # Summon one tensor at a time instead of the whole module: the naive
+        # colocate sync path runs while the rollout engine is awake holding
+        # its own copy of the weights, so load_automodel_model_to_gpu here
+        # (full model, ~64 GiB bf16 at world=1) OOMs a 140 GiB H20 next to it.
+        # The consumer (BucketedWeightSender) copies each yielded tensor into
+        # its wire buffer before pulling the next one, so per-tensor summon
+        # keeps the peak at roughly one tensor.
+        model = getattr(self.module, "_fsdp_wrapped_module", self.module)
         params = self.module.state_dict()
-        params = convert_weight_keys(params, getattr(self.module, "_fsdp_wrapped_module", self.module))
-
-        if self._is_offload_param:
-            offload_automodel_model_to_cpu(self.module)
+        # Native-layout models (NeMo names, transposed grouped experts,
+        # ``_fp32_params`` holders) must be exported in the HF checkpoint
+        # format the rollout engine's loader expects; the model carries a
+        # state_dict_adapter exactly for that when built with
+        # backend.enable_hf_state_dict_adapter=True.
+        adapter = getattr(model, "state_dict_adapter", None)
+        if adapter is None:
+            for sub in model.modules():
+                adapter = getattr(sub, "state_dict_adapter", None)
+                if adapter is not None:
+                    break
+        if adapter is not None:
+            params = adapter.to_hf(params)
+        else:
+            params = convert_weight_keys(params, model)
 
         def param_generator():
             for name, param in params.items():
                 unsharded_tensor = param.full_tensor() if isinstance(param, DTensor) else param
+                # state_dict tensors share storage with the (offloaded) params;
+                # hand the consumer a private GPU copy, not the training param
+                unsharded_tensor = unsharded_tensor.detach()
+                if unsharded_tensor.device.type == "cpu":
+                    unsharded_tensor = unsharded_tensor.to(get_device_id())
                 yield name, unsharded_tensor
 
         return param_generator(), None
