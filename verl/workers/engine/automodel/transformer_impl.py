@@ -66,6 +66,38 @@ from .utils import (
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
+# 0-diff debug capture: in-loop actor logits for the bitwise comparison against
+# the vllm rollout engine on the same sequences (C8 gate).
+_ZD_DUMP_STATE = {"n": 0}
+
+
+def _maybe_dump_zero_diff_logits(raw_output, model_inputs):
+    """Dump bf16 logits + input_ids of an actor forward (VERL_ZD_DUMP=<dir>).
+
+    Capped at VERL_ZD_DUMP_MAX (default 4) files; each file holds the pre-
+    temperature logits exactly as the model produced them, for offline
+    bitwise comparison with a vllm re-scoring pass.
+    """
+    dump_dir = os.environ.get("VERL_ZD_DUMP", "")
+    if not dump_dir:
+        return
+    logits = getattr(raw_output, "logits", None)
+    if logits is None or isinstance(logits, DTensor):
+        return
+    lg = logits.detach()
+    if lg.dim() == 3:
+        lg = lg.reshape(-1, lg.shape[-1])
+    if lg.dim() != 2:
+        return
+    if _ZD_DUMP_STATE["n"] >= int(os.environ.get("VERL_ZD_DUMP_MAX", "4")):
+        return
+    ids = model_inputs["input_ids"].detach().to(torch.int64).reshape(-1).cpu()
+    os.makedirs(dump_dir, exist_ok=True)
+    path = os.path.join(dump_dir, f"fwd_{_ZD_DUMP_STATE['n']:03d}.pt")
+    torch.save({"input_ids": ids, "logits": lg.to(torch.bfloat16).cpu()}, path)
+    _ZD_DUMP_STATE["n"] += 1
+    logger.info("zero-diff logits dump -> %s", path)
+
 
 class AutomodelEngine(BaseEngine):
     """Engine implementation using Automodel for distributed training."""
@@ -695,6 +727,7 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
                 **model_inputs,
                 use_cache=False,
             )
+            _maybe_dump_zero_diff_logits(raw_output, model_inputs)
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch

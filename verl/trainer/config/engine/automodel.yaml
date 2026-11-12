@@ -83,3 +83,10 @@ entropy_from_logits_chunk_size: 2048
 
 # Whether to use checkpointing for entropy computation
 entropy_checkpointing: false
+
+# 0-diff recipe (Qwen3.5-MoE bitwise-vllm forward, see
+# nemo_automodel qwen3_5_moe.zero_diff). Requires ddp + tp=cp=ep=pp=1.
+zero_diff: false
+# Freeze routed + shared experts (full-param grads do not fit one H20;
+# sharding breaks the recipe's full-weight contract)
+zero_diff_freeze_experts: false

@@ -75,9 +75,16 @@ def build_distributed_config_from_engine_config(engine_config, world_size):
         Tuple of (distributed_config, device_mesh, moe_mesh).
     """
     from nemo_automodel.components.distributed.config import DDPConfig, FSDP2Config, MegatronFSDPConfig
-    from nemo_automodel.components.distributed.mesh_utils import create_device_mesh
 
     strategy = engine_config.distributed_strategy
+
+    if strategy == "ddp":
+        # DDP keeps a full replica per process: no device mesh, no moe mesh
+        # (the parallelism sizes must all be 1; validated by the engine config).
+        return DDPConfig(activation_checkpointing=engine_config.activation_checkpointing), None, None
+
+    from nemo_automodel.components.distributed.mesh import ParallelismSizes
+    from nemo_automodel.components.distributed.mesh_utils import _create_device_meshes
 
     if strategy == "fsdp2":
         from torch.distributed.fsdp import MixedPrecisionPolicy
@@ -111,17 +118,79 @@ def build_distributed_config_from_engine_config(engine_config, world_size):
     else:
         raise ValueError(f"Unsupported distributed_strategy: {strategy}")
 
-    device_mesh, moe_mesh = create_device_mesh(
+    device_mesh, moe_mesh = _create_device_meshes(
         distributed_config,
-        tp_size=engine_config.tp_size,
-        pp_size=engine_config.pp_size,
-        cp_size=engine_config.cp_size,
-        ep_size=engine_config.ep_size,
-        dp_replicate_size=engine_config.dp_replicate_size,
+        ParallelismSizes(
+            tp_size=engine_config.tp_size,
+            pp_size=engine_config.pp_size,
+            cp_size=engine_config.cp_size,
+            ep_size=engine_config.ep_size,
+            dp_replicate_size=engine_config.dp_replicate_size,
+        ),
         world_size=world_size,
     )
 
     return distributed_config, device_mesh, moe_mesh
+
+
+def _build_zero_diff_model(model_config, engine_config, distributed_config, device_mesh, moe_mesh):
+    """Build the Qwen3.5-MoE component under the 0-diff (bitwise-vllm) recipe.
+
+    Bypasses the force_hf heuristic (the recipe targets the NeMo component, not
+    the HF model), forces MTP off, pins the C7-validated BackendConfig, and
+    installs the instance-level zero_diff forwards after the standard
+    load/cast pipeline (see nemo_automodel qwen3_5_moe.zero_diff).
+    """
+    import torch
+
+    from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
+    from nemo_automodel.components.distributed.config import DistributedSetup
+    from nemo_automodel.components.models.common.utils import BackendConfig
+    from nemo_automodel.components.models.qwen3_5_moe.zero_diff import install_zero_diff
+
+    model = NeMoAutoModelForCausalLM.from_pretrained(
+        pretrained_model_name_or_path=model_config.path,
+        distributed_setup=DistributedSetup.build(strategy="ddp"),
+        trust_remote_code=model_config.trust_remote_code,
+        backend=BackendConfig(
+            attn="sdpa",
+            linear="torch",
+            rope_fusion=False,
+            experts="torch",
+            dispatcher="torch",
+            enable_hf_state_dict_adapter=True,
+        ),
+        num_nextn_predict_layers=0,  # the recipe does not cover the MTP heads
+        attn_implementation="sdpa",
+        torch_dtype=torch.bfloat16,
+    )
+
+    counts = dict(install_zero_diff(model))
+    if engine_config.zero_diff_freeze_experts:
+        counts.update(_freeze_zero_diff_experts(model))
+    model.zero_diff_recipe = counts
+    return model
+
+
+def _freeze_zero_diff_experts(model):
+    """Set requires_grad=False on routed + shared expert weights.
+
+    Full-param training (params+grads ~140GB bf16) does not fit one H20 and
+    FSDP/EP sharding breaks the recipe's full-weight contract, so the C8
+    training step freezes the experts; grads still flow through the router
+    gate, shared_expert_gate, GDN/FA, norms, embed and lm_head.
+    """
+    backend = model.model.language_model
+    n_tensors = 0
+    n_params = 0
+    for layer in backend.layers.values():
+        mlp = layer.mlp
+        for mod in (mlp.experts, mlp.shared_experts):
+            for p in mod.parameters():
+                p.requires_grad_(False)
+                n_tensors += 1
+                n_params += p.numel()
+    return {"frozen_expert_tensors": n_tensors, "frozen_expert_params": n_params}
 
 
 def build_automodel_model(model_config, engine_config, distributed_config, device_mesh, moe_mesh):
@@ -138,6 +207,11 @@ def build_automodel_model(model_config, engine_config, distributed_config, devic
         A HuggingFace model with Automodel's distributed infrastructure applied.
     """
     from nemo_automodel._transformers.auto_model import NeMoAutoModelForCausalLM
+
+    if getattr(engine_config, "zero_diff", False):
+        return _build_zero_diff_model(
+            model_config, engine_config, distributed_config, device_mesh, moe_mesh
+        )
 
     kwargs = {}
 
@@ -211,7 +285,8 @@ def offload_automodel_model_to_cpu(model, empty_cache=True):
 
         fsdp_param_group._training_state = TrainingState.IDLE
 
-    model.reshard()
+    if hasattr(model, "reshard"):
+        model.reshard()
     model.cpu()
     if empty_cache:
         get_torch_device().empty_cache()

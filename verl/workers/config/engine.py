@@ -690,6 +690,16 @@ class AutomodelEngineConfig(EngineConfig):
     use_torch_compile: bool = True
     entropy_checkpointing: bool = False
 
+    # 0-diff recipe (Qwen3.5-MoE): swap the component forward for the
+    # bitwise-vllm leaf sequence (nemo_automodel qwen3_5_moe.zero_diff,
+    # validated C5/C7). Recipe contract: full-model replica per process
+    # (ddp), tp=cp=ep=pp=1, B=1 unpadded micro-batches, MTP off.
+    zero_diff: bool = False
+    # Freeze routed + shared experts before optimizer build: the full-param
+    # gradient set (params+grads ~140GB bf16) does not fit one H20, while
+    # FSDP/EP sharding breaks the recipe's full-weight contract.
+    zero_diff_freeze_experts: bool = False
+
     def __post_init__(self):
         super().__post_init__()
         assert self.strategy == "automodel", f"strategy must be 'automodel', got {self.strategy}"
@@ -697,6 +707,18 @@ class AutomodelEngineConfig(EngineConfig):
             f"distributed_strategy {self.distributed_strategy} not supported"
         )
         assert self.pp_size == 1, "Pipeline parallelism (pp_size > 1) is not yet supported for automodel backend"
+        if self.zero_diff:
+            assert self.distributed_strategy == "ddp", (
+                "zero_diff requires distributed_strategy='ddp' (full-model replica per process; "
+                "fsdp2/megatron_fsdp sharding interposes between the recipe and the weights)"
+            )
+            assert self.tp_size == 1 and self.cp_size == 1 and self.ep_size == 1 and self.dp_replicate_size == 1, (
+                "zero_diff requires tp=cp=ep=dp_replicate=1 (validated full-weight, single-sequence path)"
+            )
+            assert not self.activation_checkpointing, "zero_diff must not interpose activation-checkpointing wrappers"
+            assert not self.enable_fp8 and not self.enable_compile, "zero_diff is a bf16-exact recipe"
+            assert self.model_dtype in ("bf16", "auto"), "zero_diff loads bf16 weights (matching the vllm engine)"
+            assert self.attn_implementation in ("sdpa", None, "auto"), "zero_diff builds with the sdpa backend"
 
 
 @dataclass
