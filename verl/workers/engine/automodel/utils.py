@@ -174,6 +174,14 @@ def _build_zero_diff_model(model_config, engine_config, distributed_config, devi
         torch_dtype=torch.bfloat16,
     )
 
+    # With world_size > 1 the "ddp" setup eager-loads full weights (no meta
+    # tensors) and syncs them from rank 0, but returns the model wrapped in
+    # torch DDP — which no longer forwards attribute access. The recipe
+    # installs on the raw NeMoAutoModel (world=1 is never wrapped; the EP
+    # branch applies its own FSDP2 grouping afterwards).
+    if isinstance(model, torch.nn.parallel.DistributedDataParallel):
+        model = model.module
+
     counts = dict(install_zero_diff(model))
     if engine_config.ep_size > 1:
         # C9-D: FSDP2 + EP full-param. The recipe implements EP semantics
