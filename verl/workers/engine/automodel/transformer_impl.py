@@ -71,12 +71,14 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 _ZD_DUMP_STATE = {"n": 0}
 
 
-def _maybe_dump_zero_diff_logits(raw_output, model_inputs):
+def _maybe_dump_zero_diff_logits(raw_output, model_inputs, forward_only=None):
     """Dump bf16 logits + input_ids of an actor forward (VERL_ZD_DUMP=<dir>).
 
     Capped at VERL_ZD_DUMP_MAX (default 4) files; each file holds the pre-
     temperature logits exactly as the model produced them, for offline
-    bitwise comparison with a vllm re-scoring pass.
+    bitwise comparison with a vllm re-scoring pass. The payload records the
+    phase (forward_only=True = old_log_prob/eval forwards, False = training
+    forwards) so multi-step captures can be filtered per phase.
     """
     dump_dir = os.environ.get("VERL_ZD_DUMP", "")
     if not dump_dir:
@@ -95,7 +97,15 @@ def _maybe_dump_zero_diff_logits(raw_output, model_inputs):
     os.makedirs(dump_dir, exist_ok=True)
     rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     path = os.path.join(dump_dir, f"fwd_r{rank:02d}_{_ZD_DUMP_STATE['n']:03d}.pt")
-    torch.save({"input_ids": ids, "logits": lg.to(torch.bfloat16).cpu(), "rank": rank}, path)
+    torch.save(
+        {
+            "input_ids": ids,
+            "logits": lg.to(torch.bfloat16).cpu(),
+            "rank": rank,
+            "forward_only": forward_only,
+        },
+        path,
+    )
     _ZD_DUMP_STATE["n"] += 1
     logger.info("zero-diff logits dump -> %s", path)
 
@@ -762,7 +772,7 @@ class AutomodelEngineWithLMHead(AutomodelEngine):
                 **model_inputs,
                 use_cache=False,
             )
-            _maybe_dump_zero_diff_logits(raw_output, model_inputs)
+            _maybe_dump_zero_diff_logits(raw_output, model_inputs, forward_only)
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch
