@@ -67,7 +67,10 @@ def _dp_master_port() -> int:
         # Fallback for rollout-only workers without a trainer group: a fixed
         # high port (all ranks use the same value).
         return 37777
-    port = torch.zeros(1, dtype=torch.int64)
+    # NCCL groups require CUDA tensors; the worker has already set the
+    # current device to its local rank.
+    device = "cuda" if (torch.cuda.is_available() and dist.get_backend() == "nccl") else "cpu"
+    port = torch.zeros(1, dtype=torch.int64, device=device)
     if dist.get_rank() == 0:
         with socket.socket() as s:
             s.bind(("127.0.0.1", 0))

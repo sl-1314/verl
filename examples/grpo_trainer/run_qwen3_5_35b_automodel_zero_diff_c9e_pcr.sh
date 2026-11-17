@@ -34,6 +34,11 @@ export VLLM_BATCH_INVARIANT=1
 export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
 export LD_LIBRARY_PATH="${RAY_DATA_HOME}/envs/qwen35-am/lib:${LD_LIBRARY_PATH:-}"
 export VERL_VLLM_FORCE_VERSION=0.18.0
+# 2026-11-17 first launch died: shared-node tenant memory spiked past the Ray
+# 95% host-RAM threshold while the 4 workers (~110GB RSS each, optimizer CPU
+# offload) were loading. Node RAM freed up since; raise the kill threshold so
+# worker loading is not shot at 95%.
+export RAY_memory_usage_threshold=0.97
 
 start_time=$(date +%Y%m%d)_$(date +%H%M%S)
 mkdir -p logs
