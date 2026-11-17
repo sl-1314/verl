@@ -973,7 +973,12 @@ class RayPPOTrainer:
             # empty manager still feeds get_replicas() (-> []) so the checkpoint
             # manager's sleep/update calls become replica no-ops and the naive
             # worker path drives the in-process weight sync.
-            self.llm_server_manager = LLMServerManager.create_empty(config=self.config)
+            # worker_group satisfies LLMServerManager.__init__'s standalone-mode
+            # assert (rollout.nnodes is 0 here); the empty manager clears
+            # replicas and launches none either way.
+            self.llm_server_manager = LLMServerManager.create_empty(
+                config=self.config, worker_group=self.actor_rollout_wg
+            )
             self.async_rollout_manager = None
         else:
             self.llm_server_manager = LLMServerManager.create(

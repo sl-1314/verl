@@ -105,7 +105,14 @@ class PCRRollout(BaseRollout):
         # their EP group up from these.
         port = _dp_master_port()
         os.environ["VLLM_DP_RANK"] = str(rank)
-        os.environ["VLLM_DP_RANK_LOCAL"] = str(rank)
+        # Local rank must be 0: Ray scopes each worker's
+        # CUDA_VISIBLE_DEVICES to ONE GPU, and vllm maps the engine's device
+        # via local_rank + dp_local_rank * world_size (config/parallel.py
+        # _resolve_local_gpu_idx), so a nonzero local rank indexes past the
+        # single visible device ("Error computing device indices ...").
+        # Global group identity stays on VLLM_DP_RANK; rank_local only feeds
+        # device mapping and KV-connector rank checks (unused here).
+        os.environ["VLLM_DP_RANK_LOCAL"] = "0"
         os.environ["VLLM_DP_SIZE"] = str(self.dp_size)
         os.environ["VLLM_DP_MASTER_IP"] = "127.0.0.1"
         os.environ["VLLM_DP_MASTER_PORT"] = str(port)
