@@ -177,6 +177,13 @@ class PCRRollout(BaseRollout):
         self._llm = LLM(
             model=model_path,
             tensor_parallel_size=1,            # one engine per trainer rank
+            # Force MP workers: inside a Ray worker vllm auto-detects the Ray
+            # environment (RAY_ADDRESS) and picks RayExecutorV2, whose worker
+            # actors then wait forever on GPU resources already held by our own
+            # WorkerDict actors (run #9 hang, ray.get in _init_executor). MP
+            # keeps the worker as an EngineCore child process (the E3 rig's
+            # default outside Ray).
+            distributed_executor_backend="mp",
             enable_expert_parallel=True,       # engines form one EP group
             max_model_len=self.config.max_model_len or 4096,
             gpu_memory_utilization=self.config.gpu_memory_utilization,
