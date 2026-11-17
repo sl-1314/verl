@@ -93,8 +93,9 @@ def _maybe_dump_zero_diff_logits(raw_output, model_inputs):
         return
     ids = model_inputs["input_ids"].detach().to(torch.int64).reshape(-1).cpu()
     os.makedirs(dump_dir, exist_ok=True)
-    path = os.path.join(dump_dir, f"fwd_{_ZD_DUMP_STATE['n']:03d}.pt")
-    torch.save({"input_ids": ids, "logits": lg.to(torch.bfloat16).cpu()}, path)
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    path = os.path.join(dump_dir, f"fwd_r{rank:02d}_{_ZD_DUMP_STATE['n']:03d}.pt")
+    torch.save({"input_ids": ids, "logits": lg.to(torch.bfloat16).cpu(), "rank": rank}, path)
     _ZD_DUMP_STATE["n"] += 1
     logger.info("zero-diff logits dump -> %s", path)
 
