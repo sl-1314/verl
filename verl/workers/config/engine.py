@@ -708,13 +708,25 @@ class AutomodelEngineConfig(EngineConfig):
         )
         assert self.pp_size == 1, "Pipeline parallelism (pp_size > 1) is not yet supported for automodel backend"
         if self.zero_diff:
-            assert self.distributed_strategy == "ddp", (
-                "zero_diff requires distributed_strategy='ddp' (full-model replica per process; "
-                "fsdp2/megatron_fsdp sharding interposes between the recipe and the weights)"
-            )
-            assert self.tp_size == 1 and self.cp_size == 1 and self.ep_size == 1 and self.dp_replicate_size == 1, (
-                "zero_diff requires tp=cp=ep=dp_replicate=1 (validated full-weight, single-sequence path)"
-            )
+            if self.ep_size > 1:
+                # C9-D topology: zero_diff EP (FSDP2 + expert parallel, full
+                # param). The recipe wraps FSDP2 itself (zero_diff_ep) with
+                # the C9-B/C-validated call-graph grouping, so the engine
+                # keeps a flat world-size DP group.
+                assert self.distributed_strategy == "fsdp2", (
+                    "zero_diff ep_size>1 requires distributed_strategy='fsdp2' (manual recipe-side wrap)"
+                )
+                assert self.tp_size == 1 and self.cp_size == 1 and self.dp_replicate_size == 1, (
+                    "zero_diff EP requires tp=cp=dp_replicate=1 (ep == world_size)"
+                )
+            else:
+                assert self.distributed_strategy == "ddp", (
+                    "zero_diff requires distributed_strategy='ddp' (full-model replica per process; "
+                    "fsdp2/megatron_fsdp sharding interposes between the recipe and the weights)"
+                )
+                assert self.tp_size == 1 and self.cp_size == 1 and self.ep_size == 1 and self.dp_replicate_size == 1, (
+                    "zero_diff requires tp=cp=ep=dp_replicate=1 (validated full-weight, single-sequence path)"
+                )
             assert not self.activation_checkpointing, "zero_diff must not interpose activation-checkpointing wrappers"
             assert not self.enable_fp8 and not self.enable_compile, "zero_diff is a bf16-exact recipe"
             assert self.model_dtype in ("bf16", "auto"), "zero_diff loads bf16 weights (matching the vllm engine)"

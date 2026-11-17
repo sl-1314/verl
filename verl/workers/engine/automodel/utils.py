@@ -78,6 +78,11 @@ def build_distributed_config_from_engine_config(engine_config, world_size):
 
     strategy = engine_config.distributed_strategy
 
+    if getattr(engine_config, "zero_diff", False) and engine_config.ep_size > 1:
+        # C9-D zero-diff EP topology: the recipe handles EP/FSDP2 itself
+        # (zero_diff_ep); the engine sees a flat world-size DP group.
+        return DDPConfig(activation_checkpointing=engine_config.activation_checkpointing), None, None
+
     if strategy == "ddp":
         # DDP keeps a full replica per process: no device mesh, no moe mesh
         # (the parallelism sizes must all be 1; validated by the engine config).
@@ -140,6 +145,10 @@ def _build_zero_diff_model(model_config, engine_config, distributed_config, devi
     the HF model), forces MTP off, pins the C7-validated BackendConfig, and
     installs the instance-level zero_diff forwards after the standard
     load/cast pipeline (see nemo_automodel qwen3_5_moe.zero_diff).
+
+    ep_size > 1 selects the C9-D topology: the recipe's EP extension
+    (zero_diff_ep) plus manual FSDP2 wrapping with the C9-B/C-validated
+    call-graph grouping (full-param, world == ep_size, no frozen experts).
     """
     import torch
 
@@ -166,7 +175,27 @@ def _build_zero_diff_model(model_config, engine_config, distributed_config, devi
     )
 
     counts = dict(install_zero_diff(model))
-    if engine_config.zero_diff_freeze_experts:
+    if engine_config.ep_size > 1:
+        # C9-D: FSDP2 + EP full-param. The recipe implements EP semantics
+        # itself (expert_map + in-graph collectives on the WORLD group), so
+        # build_distributed_config stays DDP/None-mesh and the FSDP2 wrap is
+        # manual (see zero_diff_ep.wrap_fsdp2_ep for the grouping contract).
+        world = torch.distributed.get_world_size()
+        assert engine_config.ep_size == world, (
+            f"zero-diff EP requires ep_size == world_size ({engine_config.ep_size} vs {world})"
+        )
+        assert not engine_config.zero_diff_freeze_experts, (
+            "zero_diff_freeze_experts is the C8 single-GPU workaround; the EP "
+            "topology trains full-param"
+        )
+        from nemo_automodel.components.models.qwen3_5_moe.zero_diff_ep import (
+            install_zero_diff_ep,
+            wrap_fsdp2_ep,
+        )
+
+        counts.update(install_zero_diff_ep(model, torch.distributed.get_rank(), world))
+        counts.update(wrap_fsdp2_ep(model))
+    elif engine_config.zero_diff_freeze_experts:
         counts.update(_freeze_zero_diff_experts(model))
     model.zero_diff_recipe = counts
     return model

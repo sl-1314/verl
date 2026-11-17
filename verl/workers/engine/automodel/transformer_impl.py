@@ -280,8 +280,10 @@ class AutomodelEngine(BaseEngine):
         if not forward_only:
             prepare_for_grad_accumulation([self.module])
 
-            # Set MoE aux loss backward scale to counteract FSDP's gradient allreduce.
-            if self.engine_config.ep_size > 1:
+            # Set MoE aux loss backward scale to counteract FSDP's gradient
+            # allreduce (Megatron MoE path only; the zero-diff recipe has no
+            # aux loss).
+            if self.engine_config.ep_size > 1 and not getattr(self.engine_config, "zero_diff", False):
                 from nemo_automodel.components.moe.megatron.moe_utils import MoEAuxLossAutoScaler
 
                 MoEAuxLossAutoScaler.main_loss_backward_scale = torch.tensor(
