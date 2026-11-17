@@ -28,6 +28,7 @@ from omegaconf import DictConfig, open_dict
 from tensordict import NonTensorData, TensorDict
 from torch.distributed.device_mesh import init_device_mesh
 
+from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineRegistry
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, make_nd_compute_dataproto_dispatch_fn, register
@@ -761,6 +762,21 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         output = self.actor.infer_batch(data)
 
         return output.cpu() if output is not None else None
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+    @DistProfiler.annotate(color="red", role="pcr_generate_sequences")
+    def generate_sequences(self, data: DataProto) -> DataProto:
+        """Sync rollout generation through the worker's rollout object.
+
+        Only valid for rollout.mode == "pcr" (the in-process SPMD
+        prefill-recompute rollout). All DP ranks enter together via the
+        dispatch, so the per-step barriers inside the rollout line up.
+        """
+        assert "rollout" in self.role and self.rollout is not None, (
+            "generate_sequences requires a rollout object (rollout.mode='pcr')"
+        )
+        output = self.rollout.generate_sequences(data)
+        return output.cpu() if isinstance(output, DataProto) else output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     # scheduled=True: this stage iterates over update mini-batches, so in discrete mode its trace

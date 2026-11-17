@@ -637,9 +637,19 @@ class RayPPOTrainer:
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
             # pad to be divisible by dp_size
-            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+            if self.rollout_mode_pcr:
+                # PCR: the dispatch shards across the actor mesh DP ranks
+                # (TP1 colocate: one in-process engine per worker).
+                size_divisor = self.actor_rollout_wg.world_size
+            else:
+                size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
             test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            if self.rollout_mode_pcr:
+                test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
+                test_output_gen_batch_padded = test_output_gen_batch_padded.to("cpu")
+                test_output_gen_batch_padded.meta_info.setdefault("timing", {})
+            else:
+                test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
@@ -924,6 +934,12 @@ class RayPPOTrainer:
         # Note: mode is always "async" since sync mode is deprecated
         self.async_rollout_mode = True
 
+        # Zero-diff PCR rollout (rollout.mode == "pcr"): the rollout object
+        # lives inside each actor worker (in-process SPMD vLLM engine) and
+        # generation is dispatched synchronously through the worker group.
+        # No vLLMHttpServer / agent-loop manager is launched in that mode.
+        self.rollout_mode_pcr = self.config.actor_rollout_ref.rollout.mode == "pcr"
+
         # initialize teacher loop manager
         if self.use_teacher_policy:
             from verl.experimental.teacher_loop import MultiTeacherModelManager
@@ -950,21 +966,33 @@ class RayPPOTrainer:
         # two conditions satisfied: (1) no reward model, or (2) reward model with extra resource pool
         enable_agent_reward_loop = not self.use_rm or self.config.reward.reward_model.enable_resource_pool
 
-        self.llm_server_manager = LLMServerManager.create(
-            config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
-        )
+        if self.rollout_mode_pcr:
+            # PCR: the rollout object lives inside each actor worker (in-process
+            # SPMD vLLM engine) and generation is dispatched synchronously through
+            # the worker group -- no vLLMHttpServer / agent-loop manager. The
+            # empty manager still feeds get_replicas() (-> []) so the checkpoint
+            # manager's sleep/update calls become replica no-ops and the naive
+            # worker path drives the in-process weight sync.
+            self.llm_server_manager = LLMServerManager.create_empty(config=self.config)
+            self.async_rollout_manager = None
+        else:
+            self.llm_server_manager = LLMServerManager.create(
+                config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
+            )
 
-        # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
-        # to stream reward computation with actor rollout
-        # To stream teacher computation with actor rollout, we instead pass the full manager so that the
-        # teacher loop workers can sleep/wake together with rollout workers
-        reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
-        self.async_rollout_manager = AgentLoopManager.create(
-            config=self.config,
-            llm_client=self.llm_server_manager.get_client(),
-            teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
-            reward_loop_worker_handles=reward_loop_worker_handles,
-        )
+            # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
+            # to stream reward computation with actor rollout
+            # To stream teacher computation with actor rollout, we instead pass the full manager so that the
+            # teacher loop workers can sleep/wake together with rollout workers
+            reward_loop_worker_handles = (
+                self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+            )
+            self.async_rollout_manager = AgentLoopManager.create(
+                config=self.config,
+                llm_client=self.llm_server_manager.get_client(),
+                teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
+                reward_loop_worker_handles=reward_loop_worker_handles,
+            )
 
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         # Support custom CheckpointEngineManager via config
@@ -1510,12 +1538,27 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
-                        if curr_step_profile:
+                        if self.rollout_mode_pcr:
+                            # Zero-diff PCR rollout: in-process SPMD engines on the
+                            # trainer workers, sync dispatch (per-step barriers
+                            # inside the rollout line the DP ranks up). The dispatch
+                            # shards the batch across the actor mesh DP ranks, so
+                            # pad to that divisor first (TP1 colocate: one engine
+                            # per worker => dp == worker world size).
+                            pcr_dp_size = self.actor_rollout_wg.world_size
+                            combined_gen_batch, pcr_pad_size = pad_dataproto_to_divisor(combined_gen_batch, pcr_dp_size)
+                            combined_gen_output = self.actor_rollout_wg.generate_sequences(combined_gen_batch)
+                            combined_gen_output = combined_gen_output.to("cpu")
+                            combined_gen_output = unpad_dataproto(combined_gen_output, pad_size=pcr_pad_size)
+                            combined_gen_output.meta_info.setdefault("timing", {})
+                        elif curr_step_profile:
                             self.llm_server_manager.start_profile()
-                        combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
-                        self.checkpoint_manager.sleep_replicas()
-                        if curr_step_profile:
+                            combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                            self.checkpoint_manager.sleep_replicas()
                             self.llm_server_manager.stop_profile()
+                        else:
+                            combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                            self.checkpoint_manager.sleep_replicas()
 
                         timing_raw.update(combined_gen_output.meta_info["timing"])
                         combined_gen_output.meta_info.pop("timing", None)
