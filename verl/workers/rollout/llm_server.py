@@ -449,8 +449,13 @@ class LLMServerManager:
         """
         if start_rank is None:
             start_rank = self.start_rank
+        pcp_size = max(
+            int((self.rollout_config.get("engine_kwargs") or {}).get("vllm", {}).get("prefill_context_parallel_size") or 1),
+            1,
+        )
         rollout_world_size = (
             self.rollout_config.tensor_model_parallel_size
+            * pcp_size
             * self.rollout_config.data_parallel_size
             * self.rollout_config.pipeline_model_parallel_size
         )

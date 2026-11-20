@@ -120,8 +120,10 @@ class RolloutReplica(ABC):
             self.config.prefix_cache_namespace = _PREFIX_CACHE_NAMESPACE
         self.model_config: HFModelConfig = model_config
 
+        pcp_size = max(int((self.config.engine_kwargs.get("vllm") or {}).get("prefill_context_parallel_size") or 1), 1)
         self.world_size = (
             self.config.tensor_model_parallel_size
+            * pcp_size
             * self.config.data_parallel_size
             * self.config.pipeline_model_parallel_size
         )

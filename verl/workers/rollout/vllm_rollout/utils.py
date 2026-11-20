@@ -65,6 +65,8 @@ def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config
         return worker_local_rank
 
     tp_size = max(int(getattr(parallel_config, "tensor_parallel_size", 1) or 1), 1)
+    pcp_size = max(int(getattr(parallel_config, "prefill_context_parallel_size", 1) or 1), 1)
+    tp_pcp = tp_size * pcp_size
     dp_size = int(getattr(parallel_config, "data_parallel_size", 1) or 1)
     dp_local_size = int(getattr(parallel_config, "data_parallel_size_local", 1) or 1)
     if dp_size <= 1 and dp_local_size <= 1:
@@ -81,8 +83,8 @@ def _resolve_vllm_weight_sync_local_rank(worker_local_rank: int, parallel_config
     if dp_local_rank is None:
         return worker_local_rank
 
-    tp_rank = worker_local_rank % tp_size
-    return int(dp_local_rank) * tp_size + tp_rank
+    tp_pcp_rank = worker_local_rank % tp_pcp
+    return int(dp_local_rank) * tp_pcp + tp_pcp_rank
 
 
 def set_death_signal():

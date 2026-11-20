@@ -208,8 +208,10 @@ class vLLMHttpServer:
         # `ranks` in the rollout profiler config are global GPU ranks (as in the training roles);
         # map them to the replica that owns them so e.g. ranks=[0, 8] with tp=8 profiles the replicas
         # holding global ranks 0 and 8 (replicas 0 and 1), not replica indices 0 and 8.
+        pcp_size = max(int((self.config.engine_kwargs.get("vllm") or {}).get("prefill_context_parallel_size") or 1), 1)
         self.replica_world_size = (
             self.config.tensor_model_parallel_size
+            * pcp_size
             * self.config.data_parallel_size
             * self.config.pipeline_model_parallel_size
         )
@@ -270,6 +272,12 @@ class vLLMHttpServer:
         args: tuple = (),
         kwargs: dict[str, Any] | None = None,
     ):
+        # DPLBAsyncMPClient.call_utility_async only calls engine 0 (DP rank 0);
+        # broadcast across all managed engines so DP>1 shards all receive weight sync RPCs.
+        if self.config.data_parallel_size > 1 and hasattr(self.engine.engine_core, "call_utility_all_async"):
+            return await self.engine.engine_core.call_utility_all_async(
+                "collective_rpc", method, timeout, args, kwargs
+            )
         return await self.engine.collective_rpc(
             method=method,
             timeout=timeout,
@@ -406,13 +414,15 @@ class vLLMHttpServer:
             )
 
         if self.config.data_parallel_size > 1:
-            assert self.gpus_per_node % self.config.tensor_model_parallel_size == 0, (
-                "gpus_per_node should be divisible by tensor_model_parallel_size"
+            pcp_size = max(int(engine_kwargs.get("prefill_context_parallel_size") or 1), 1)
+            tp_pcp = self.config.tensor_model_parallel_size * pcp_size
+            assert self.gpus_per_node % tp_pcp == 0, (
+                "gpus_per_node should be divisible by tensor_model_parallel_size * prefill_context_parallel_size"
             )
-            data_parallel_size_local = self.gpus_per_node // self.config.tensor_model_parallel_size
-            assert len(self.workers) == data_parallel_size_local * self.config.tensor_model_parallel_size, (
+            data_parallel_size_local = self.gpus_per_node // tp_pcp
+            assert len(self.workers) == data_parallel_size_local * tp_pcp, (
                 f"num workers ({len(self.workers)}) should be equal to "
-                f"dp_size_local ({data_parallel_size_local}) * tp_size ({self.config.tensor_model_parallel_size})"
+                f"dp_size_local ({data_parallel_size_local}) * tp_size * pcp_size ({tp_pcp})"
             )
             dp_args = {
                 "data_parallel_size": self.config.data_parallel_size,
@@ -533,13 +543,16 @@ class vLLMHttpServer:
         await engine_client.reset_mm_cache()
         # A sampled <|image_pad|>/<|video_pad|> has no image behind it, and every consumer of the
         # sequence assumes it does. Mask them out with the OOV tail, so the policy cannot pick one.
-        await engine_client.collective_rpc(
-            method="monkey_patch_model",
-            kwargs={
-                "vocab_size": len(self.model_config.tokenizer),
-                "banned_token_ids": get_vision_placeholder_token_ids(self.model_config.processor),
-            },
-        )
+        # Under VLLM_BATCH_INVARIANT=1, masking vLLM logits without an identical mask on the
+        # training side creates a systematic log-partition-function shift between rollout and actor.
+        if os.environ.get("VLLM_BATCH_INVARIANT", "0") != "1":
+            await engine_client.collective_rpc(
+                method="monkey_patch_model",
+                kwargs={
+                    "vocab_size": len(self.model_config.tokenizer),
+                    "banned_token_ids": get_vision_placeholder_token_ids(self.model_config.processor),
+                },
+            )
 
         build_app_sig = inspect.signature(build_app)
         supported_tasks: tuple[Any, ...] = ()

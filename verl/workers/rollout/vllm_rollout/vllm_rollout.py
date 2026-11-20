@@ -76,8 +76,9 @@ class ServerAdapter(BaseRollout):
             )
             per_replica = prefill_tp * disagg.prefill_replicas + decode_tp * disagg.decode_replicas
         else:
-            decode_tp = prefill_tp
-            per_replica = prefill_tp
+            pcp_size = max(int((self.config.engine_kwargs.get("vllm") or {}).get("prefill_context_parallel_size") or 1), 1)
+            decode_tp = prefill_tp * pcp_size
+            per_replica = prefill_tp * pcp_size
         rollout_world_size = per_replica * self.config.data_parallel_size * self.config.pipeline_model_parallel_size
         if replica_rank == -1:
             self.replica_rank = rank // rollout_world_size
