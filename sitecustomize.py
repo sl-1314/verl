@@ -52,6 +52,34 @@ def _quiet_vllm_optional_module_probe() -> None:
     vllm_iu._quiet_has_module_patched = True
 
 
+def _patch_mrope_cache_device() -> None:
+    """Force the Qwen3.5 BI RoPE cos/sin cache to be built ON GPU, like vLLM's engine.
+
+    vLLM constructs its MRotaryEmbedding under the model device context, so cos/sin
+    are computed on GPU; megatron's bi_ops.get_vllm_mrope_cache builds them on CPU
+    and moves the result. CPU libm cos and GPU cos differ by 1 ULP in fp32 at many
+    arguments; after bf16 rounding 63/262144 (position, freq) cache values still
+    differ by 1 ULP (first at position 4498), which breaks the rollout-vs-recompute
+    bitwise parity from that position on (every sequence diverges at abs ~4498, and
+    sequences shorter than that stay clean). Building on the same device makes the
+    two caches bit-identical.
+    """
+    import megatron.lite.model.qwen3_5.lite.bi_ops as bi_ops_mod
+
+    if getattr(bi_ops_mod, "_mrope_cache_device_patched", False):
+        return
+    orig_get_cache = bi_ops_mod.get_vllm_mrope_cache
+
+    def _gpu_built_mrope_cache(head_dim, max_position_embeddings, rope_theta,
+                                partial_rotary_factor, mrope_section, device_str):
+        with torch.device(device_str):
+            return orig_get_cache(head_dim, max_position_embeddings, rope_theta,
+                                  partial_rotary_factor, mrope_section, device_str)
+
+    bi_ops_mod.get_vllm_mrope_cache = _gpu_built_mrope_cache
+    bi_ops_mod._mrope_cache_device_patched = True
+
+
 def _install_qwen35_bi_longctx_patches() -> None:
     """Install BI=1 22k long-context memory patches into megatron.lite (0-diff preserved):
     1) Pass inplace_final_state=True to fused_sigmoid_gating_delta_rule_update in _BIFusedGdnFn
@@ -289,4 +317,5 @@ if os.environ.get("VERL_MLITE_SKIP_RUNTIME_PATCHES") != "1":
         pass
     else:
         apply_runtime_patches()
+        _patch_mrope_cache_device()
         _install_qwen35_bi_longctx_patches()
