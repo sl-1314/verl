@@ -169,7 +169,10 @@ def _install_qwen35_bi_longctx_patches() -> None:
 
 
 if os.environ.get("VERL_MLITE_SKIP_RUNTIME_PATCHES") != "1":
-    from verl_mlite.compat import apply_runtime_patches
-
-    apply_runtime_patches()
-    _install_qwen35_bi_longctx_patches()
+    try:
+        from verl_mlite.compat import apply_runtime_patches
+    except ImportError:
+        pass
+    else:
+        apply_runtime_patches()
+        _install_qwen35_bi_longctx_patches()
