@@ -192,6 +192,42 @@ def _install_qwen35_bi_longctx_patches() -> None:
         def shape(self):
             return (*self.hidden.shape[:-1], self.weight.shape[0])
 
+        @property
+        def dtype(self):
+            return self.weight.dtype
+
+        @property
+        def device(self):
+            return self.hidden.device
+
+        def __getattr__(self, name: str):
+            # Unknown attribute (e.g. .float()/.detach()/.to()): fall back to the
+            # materialized logits so unexpected call sites keep the pre-patch
+            # behavior (memory-heavy but correct) instead of raising AttributeError.
+            if name.startswith("__"):
+                raise AttributeError(name)
+            return getattr(self.materialize(), name)
+
+        def entropy(self, tp_group=None) -> torch.Tensor:
+            """Token-chunked mirror of vocab_parallel_entropy (bi_mode has tp_size == 1)."""
+            h2 = self.hidden.reshape(-1, self.hidden.shape[-1])
+            w_local = self.weight.to_local() if hasattr(self.weight, "to_local") else self.weight
+            T = h2.shape[0]
+            out = torch.empty((T,), dtype=torch.float32, device=h2.device)
+            chunk = 1024
+            for start in range(0, T, chunk):
+                end = min(start + chunk, T)
+                logits_c = F.linear(h2[start:end], w_local)
+                if self.temp != 1.0:
+                    logits_c = logits_c / self.temp
+                logits_c = logits_c.float()
+                logits_max = logits_c.max(dim=-1).values
+                exp_logits = torch.exp(logits_c - logits_max.unsqueeze(-1))
+                sum_exp = exp_logits.sum(dim=-1)
+                weighted = (exp_logits * logits_c).sum(dim=-1)
+                out[start:end] = torch.log(sum_exp) + logits_max - weighted / sum_exp
+            return out.view(self.hidden.shape[:-1])
+
     orig_bi_linear: Callable = bi_ops.bi_linear
     orig_bi_ce: Callable = bi_ops.bi_vocab_cross_entropy
 
@@ -207,6 +243,42 @@ def _install_qwen35_bi_longctx_patches() -> None:
 
     bi_ops.bi_linear = _hooked_bi_linear
     bi_ops.bi_vocab_cross_entropy = _hooked_bi_vocab_ce
+
+    # 4. Route vocab_parallel_entropy through the proxy's chunked entropy: the old-log-prob
+    #    pass hardcodes calculate_entropy=True (actor/entropy metric), and the vanilla path
+    #    would materialize logits.float() ([T, vocab] fp32, 22 GiB @ 22k tokens).
+    try:
+        import megatron.lite.primitive.ops.logprob as logprob_mod
+    except Exception:
+        logprob_mod = None
+    if logprob_mod is not None and not getattr(logprob_mod, "_qwen35_bi_entropy_patched", False):
+        logprob_mod._qwen35_bi_entropy_patched = True
+        orig_vocab_parallel_entropy = logprob_mod.vocab_parallel_entropy
+
+        def _patched_vocab_parallel_entropy(logits, tp_group=None):
+            if isinstance(logits, _LazyVocabLogitsProxy):
+                world_size = 1
+                if tp_group is not None:
+                    try:
+                        import torch.distributed as dist
+
+                        if dist.is_initialized():
+                            world_size = dist.get_world_size(tp_group)
+                    except Exception:
+                        world_size = 1
+                if world_size == 1:
+                    return logits.entropy(tp_group)
+                logits = logits.materialize()
+            return orig_vocab_parallel_entropy(logits, tp_group)
+
+        logprob_mod.vocab_parallel_entropy = _patched_vocab_parallel_entropy
+        # model.py binds the name at import time ("from ...logprob import ...");
+        # rebind it there too if the module is already loaded.
+        import sys
+
+        model_mod = sys.modules.get("megatron.lite.model.qwen3_5.lite.model")
+        if model_mod is not None and getattr(model_mod, "vocab_parallel_entropy", None) is orig_vocab_parallel_entropy:
+            model_mod.vocab_parallel_entropy = _patched_vocab_parallel_entropy
 
 
 if os.environ.get("VERL_MLITE_SKIP_RUNTIME_PATCHES") != "1":
