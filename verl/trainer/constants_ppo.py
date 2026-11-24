@@ -213,6 +213,11 @@ def get_ppo_ray_runtime_env(config=None):
         "FLASH_ATTENTION_DETERMINISTIC",
         "NCCL_DETERMINISTIC",
         "NCCL_ALGO",
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "NUMEXPR_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "OMP_NUM_THREADS",
         *BATCH_INVARIANT_ENV,
     ):
         val = os.environ.get(key)

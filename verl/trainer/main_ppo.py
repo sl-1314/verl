@@ -81,6 +81,10 @@ def run_ppo(config, task_runner_class) -> None:
         # user's ray_kwargs.ray_init.runtime_env, so the user's config wins on conflicts.
         platform_runtime_env = get_platform().get_ray_init_kwargs().get("runtime_env", {})
         runtime_env = OmegaConf.merge(default_runtime_env, platform_runtime_env, runtime_env_kwargs)
+        if "env_vars" in runtime_env and runtime_env["env_vars"] is not None:
+            for k, v in list(runtime_env["env_vars"].items()):
+                if v is not None and not isinstance(v, str):
+                    runtime_env["env_vars"][k] = str(v)
         ray_init_kwargs = OmegaConf.create({**ray_init_kwargs, "runtime_env": runtime_env})
         print(f"ray init kwargs: {ray_init_kwargs}")
         ray.init(**OmegaConf.to_container(ray_init_kwargs))

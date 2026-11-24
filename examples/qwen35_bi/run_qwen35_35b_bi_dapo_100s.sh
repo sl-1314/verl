@@ -215,7 +215,4 @@ TRAINER_LOGGERS="${TRAINER_LOGGERS:-[console,file,tensorboard]}"
   +trainer.rollout_data_dir="${OUT_DIR}/rollout_dump" \
   ++ray_kwargs.ray_init.runtime_env.env_vars.VERL_FILE_LOGGER_PATH="${VERL_FILE_LOGGER_PATH}" \
   ++ray_kwargs.ray_init.runtime_env.env_vars.TENSORBOARD_DIR="${TENSORBOARD_DIR}" \
-  ++ray_kwargs.ray_init.runtime_env.env_vars.OPENBLAS_NUM_THREADS=1 \
-  ++ray_kwargs.ray_init.runtime_env.env_vars.MKL_NUM_THREADS=1 \
-  ++ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS=4 \
   "$@" 2>&1 | tee "${OUT_DIR}/run.log"
