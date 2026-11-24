@@ -21,9 +21,14 @@ export LD_LIBRARY_PATH="/env/base-py312/lib:/usr/local/cuda/lib64:${LD_LIBRARY_P
 # Put . and VERL_ROOT first so uploaded jobs/verl always shadows /env/mlite-bi/.../site-packages/verl
 export PYTHONPATH=".:${VERL_ROOT}:${EXAMPLE_ROOT}:${LITE_ROOT}:${MEGATRON_ROOT}:${PYTHONPATH:-}"
 
-# Batch-Invariant (BI=1) deterministic environment
+# Batch-Invariant (BI=1) deterministic environment + thread caps for 160-core node
 export RAY_OVERRIDE_JOB_RUNTIME_ENV=1
 export VERL_MLITE_SKIP_RUNTIME_PATCHES=0
+export OPENBLAS_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+export VECLIB_MAXIMUM_THREADS=1
+export OMP_NUM_THREADS=4
 export VLLM_BATCH_INVARIANT=1
 export VLLM_USE_V1=1
 export VLLM_ALLREDUCE_USE_SYMM_MEM=0
@@ -182,4 +187,7 @@ fi
   trainer.val_before_train=False \
   +trainer.rollout_data_dir="${OUT_DIR}/rollout_dump" \
   ++ray_kwargs.ray_init.runtime_env.env_vars.VERL_FILE_LOGGER_PATH="${VERL_FILE_LOGGER_PATH}" \
+  ++ray_kwargs.ray_init.runtime_env.env_vars.OPENBLAS_NUM_THREADS=1 \
+  ++ray_kwargs.ray_init.runtime_env.env_vars.MKL_NUM_THREADS=1 \
+  ++ray_kwargs.ray_init.runtime_env.env_vars.OMP_NUM_THREADS=4 \
   "$@" 2>&1 | tee "${OUT_DIR}/run.log"

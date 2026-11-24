@@ -3,12 +3,53 @@
 
 from __future__ import annotations
 
+import importlib
+import importlib.util
 import os
+import warnings
 from collections.abc import Callable
+from functools import cache
+
+# Cap default OpenBLAS / MKL / OMP thread pools before numpy/scipy/torch import so
+# 30+ concurrent Ray actors on a 160-core node do not spawn 128 OpenBLAS threads each
+# and exhaust pthread_create ("Resource temporarily unavailable").
+for _thr_var in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_thr_var, "1")
+os.environ.setdefault("OMP_NUM_THREADS", "4")
+
+warnings.filterwarnings("ignore", message=r"The cuda\.(cudart|nvrtc) module is deprecated", category=FutureWarning)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+def _quiet_vllm_optional_module_probe() -> None:
+    """Fix vllm.utils.import_utils._has_module so missing parent packages (e.g. 'torchcodec'
+    when probing 'torchcodec.decoders') return False quietly instead of logging a full
+    ModuleNotFoundError traceback via logger.warning(..., exc_info=True)."""
+    try:
+        import vllm.utils.import_utils as vllm_iu
+    except Exception:
+        return
+    if getattr(vllm_iu, "_quiet_has_module_patched", False):
+        return
+
+    @cache
+    def _quiet_has_module(module_name: str) -> bool:
+        try:
+            if importlib.util.find_spec(module_name) is None:
+                return False
+            importlib.import_module(module_name)
+        except ModuleNotFoundError:
+            return False
+        except Exception:
+            vllm_iu.logger.warning("Module %s was found but failed to import", module_name, exc_info=True)
+            return False
+        return True
+
+    vllm_iu._has_module = _quiet_has_module
+    vllm_iu._quiet_has_module_patched = True
 
 
 def _install_qwen35_bi_longctx_patches() -> None:
@@ -169,6 +210,7 @@ def _install_qwen35_bi_longctx_patches() -> None:
 
 
 if os.environ.get("VERL_MLITE_SKIP_RUNTIME_PATCHES") != "1":
+    _quiet_vllm_optional_module_probe()
     try:
         from verl_mlite.compat import apply_runtime_patches
     except ImportError:
