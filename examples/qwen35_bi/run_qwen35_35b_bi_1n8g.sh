@@ -82,7 +82,7 @@ FSDP2_USE_FP32_SHARDS="${FSDP2_USE_FP32_SHARDS:-False}"
 FSDP2_USE_FP32_MASTER="${FSDP2_USE_FP32_MASTER:-False}"
 FSDP2_ADAMW_FOREACH="${FSDP2_ADAMW_FOREACH:-False}"
 
-RUN_ID="${RUN_ID:-qwen35_35b_bi_$(date +%m%d%H%M%S)}"
+RUN_ID="${RUN_ID:-${RAY_JOB_SUBMISSION_ID:-qwen35_35b_bi_$(date +%m%d%H%M%S)}}"
 OUT_DIR="${OUT_DIR:-${DOLPHINFS_USER_BASE}/outputs/${RUN_ID}}"
 mkdir -p "${OUT_DIR}/ckpt" "${OUT_DIR}/rollout_dump"
 
