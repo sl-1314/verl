@@ -112,6 +112,13 @@ mkdir -p "${TORCHINDUCTOR_CACHE_DIR}" "${TRITON_CACHE_DIR}"
 "${PY}" -c "from torch.utils.tensorboard import SummaryWriter; print('TensorBoard SummaryWriter OK, dir=', '${TENSORBOARD_DIR}')"
 TRAINER_LOGGERS="${TRAINER_LOGGERS:-[console,file,tensorboard]}"
 
+# Optional: forward the position-resolved diff dump path (VERL_DIFF_POS_DUMP) into the
+# TaskRunnerV1 actor via ray_init runtime_env (same mechanism as VERL_FILE_LOGGER_PATH).
+EXTRA_HYDRA_ARGS=()
+if [[ -n "${VERL_DIFF_POS_DUMP:-}" ]]; then
+  EXTRA_HYDRA_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.VERL_DIFF_POS_DUMP=${VERL_DIFF_POS_DUMP}")
+fi
+
 "${PY}" -m verl_mlite.launch verl.trainer.main_ppo \
   hydra.searchpath=[pkg://verl_mlite.config] \
   algorithm.adv_estimator=grpo \
@@ -215,4 +222,5 @@ TRAINER_LOGGERS="${TRAINER_LOGGERS:-[console,file,tensorboard]}"
   +trainer.rollout_data_dir="${OUT_DIR}/rollout_dump" \
   ++ray_kwargs.ray_init.runtime_env.env_vars.VERL_FILE_LOGGER_PATH="${VERL_FILE_LOGGER_PATH}" \
   ++ray_kwargs.ray_init.runtime_env.env_vars.TENSORBOARD_DIR="${TENSORBOARD_DIR}" \
+  "${EXTRA_HYDRA_ARGS[@]}" \
   "$@" 2>&1 | tee "${OUT_DIR}/run.log"
