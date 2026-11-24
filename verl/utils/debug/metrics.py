@@ -12,12 +12,82 @@
 # limitations under the License.
 
 import logging
+import os
 
 import torch
 
 from verl.protocol import DataProto
 
 logger = logging.getLogger(__file__)
+
+# Response-position buckets for the env-gated position-resolved diff dump
+# (VERL_DIFF_POS_DUMP=/path/to/dump.jsonl): distinguishes "diff grows with position"
+# (recurrent-state drift), "diff concentrated after chunk boundaries" and "diff already
+# present at the first response token" (prompt/prefill-side divergence).
+_POS_BUCKETS = [(0, 1024), (1024, 4096), (4096, 8192), (8192, 16384), (16384, 1 << 30)]
+
+
+def _dump_position_resolved_diff(
+    actor_logprobs: torch.Tensor, rollout_logprobs: torch.Tensor, response_mask: torch.Tensor, responses: torch.Tensor
+) -> None:
+    """Append per-sequence, position-resolved rollout-vs-actor logprob diff stats to a
+    jsonl file when VERL_DIFF_POS_DUMP is set. No-op otherwise."""
+    dump_path = os.environ.get("VERL_DIFF_POS_DUMP", "")
+    if not dump_path:
+        return
+    try:
+        import json
+        import time
+
+        diff = (rollout_logprobs - actor_logprobs).abs()[..., -responses.size(1):].float().cpu()
+        mask = response_mask[..., -responses.size(1):].bool().cpu()
+        bsz = diff.shape[0]
+        seq_records = []
+        bucket_totals = [[0, 0, 0.0, 0.0] for _ in _POS_BUCKETS]  # mismatch, total, sum_diff, max_diff
+        for i in range(bsz):
+            valid = mask[i]
+            if not valid.any():
+                continue
+            d = diff[i][valid]
+            n = int(d.numel())
+            nz = d != 0
+            first_div = int(torch.nonzero(nz).min().item()) if nz.any() else None
+            amax = int(d.argmax().item()) if n > 0 else None
+            seq_records.append(
+                {
+                    "n": n,
+                    "mismatch": int(nz.sum().item()),
+                    "first_div_pos": first_div,
+                    "diff_at_pos0": float(d[0].item()) if n > 0 else None,
+                    "mean_diff": float(d.mean().item()),
+                    "max_diff": float(d.max().item()) if n > 0 else None,
+                    "argmax_pos": amax,
+                }
+            )
+            for b, (lo, hi) in enumerate(_POS_BUCKETS):
+                seg = d[lo:hi]
+                if seg.numel() == 0:
+                    continue
+                seg_nz = seg != 0
+                bucket_totals[b][0] += int(seg_nz.sum().item())
+                bucket_totals[b][1] += int(seg.numel())
+                bucket_totals[b][2] += float(seg.sum().item())
+                bucket_totals[b][3] = max(bucket_totals[b][3], float(seg.max().item()))
+        buckets = [
+            {
+                "range": f"[{lo},{hi})",
+                "mismatch": t[0],
+                "total": t[1],
+                "mean_diff": (t[2] / t[1]) if t[1] else 0.0,
+                "max_diff": t[3],
+            }
+            for (lo, hi), t in zip(_POS_BUCKETS, bucket_totals, strict=True)
+        ]
+        os.makedirs(os.path.dirname(dump_path) or ".", exist_ok=True)
+        with open(dump_path, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "bsz": bsz, "buckets": buckets, "seqs": seq_records}) + "\n")
+    except Exception as e:  # never break training for a debug dump
+        logger.warning(f"VERL_DIFF_POS_DUMP failed: {e!r}")
 
 
 def calculate_token_list_diff(tensor1: torch.Tensor, tensor2: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -123,6 +193,9 @@ def calculate_debug_metrics(data: DataProto) -> dict:
         actor_old_log_probs.float(), rollout_old_log_probs.float(), response_mask_bool
     )
     logprobs_mismatch = rollout_logprobs_diff != 0
+    _dump_position_resolved_diff(
+        actor_old_log_probs.float(), rollout_old_log_probs.float(), response_mask_bool, responses
+    )
     return {
         "training/rollout_probs_diff_valid": 1,
         "training/rollout_probs_diff_max": torch.max(rollout_probs_diff).detach().item(),
