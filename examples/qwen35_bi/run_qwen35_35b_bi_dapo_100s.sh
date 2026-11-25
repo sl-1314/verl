@@ -81,6 +81,7 @@ MAX_MODEL_LEN="$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))"
 PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-${MAX_MODEL_LEN}}"
 LOG_PROB_MAX_TOKEN_LEN_PER_GPU="${LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${MAX_MODEL_LEN}}"
 OVERLONG_BUFFER_LEN="${OVERLONG_BUFFER_LEN:-4096}"
+OVERLONG_ENABLE="${OVERLONG_ENABLE:-True}"
 ENABLE_THINKING="${ENABLE_THINKING:-True}"
 
 ROLLOUT_N="${ROLLOUT_N:-4}"
@@ -201,7 +202,7 @@ fi
   actor_rollout_ref.rollout.top_k=-1 \
   actor_rollout_ref.rollout.free_cache_engine=True \
   reward.reward_manager.name=dapo \
-  +reward.reward_kwargs.overlong_buffer_cfg.enable=True \
+  +reward.reward_kwargs.overlong_buffer_cfg.enable="${OVERLONG_ENABLE}" \
   +reward.reward_kwargs.overlong_buffer_cfg.len="${OVERLONG_BUFFER_LEN}" \
   +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0 \
   +reward.reward_kwargs.overlong_buffer_cfg.log=True \
